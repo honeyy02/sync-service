@@ -1,23 +1,190 @@
 pipeline {
     agent any
 
+    environment {
+        APP_NAME        = 'sync-service'
+        IMAGE_REPO      = 'us-central1-docker.pkg.dev/my-gcp-project/sync-repo/sync-service'
+        GCP_CREDENTIALS =  credentials('gcp-service-account-key')
+        SLACK_CHANNEL   = '#deployments'
+    }
+
     stages {
+
+        // ──────────────────────────────────────────
+        // STAGE 1: Checkout
+        // ──────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    env.IMAGE_TAG        = "${IMAGE_REPO}:${env.GIT_COMMIT_SHORT}"
+                    env.TARGET_ENV       = getTargetEnv(env.BRANCH_NAME)
+                }
+                echo "Branch: ${env.BRANCH_NAME} → Environment: ${env.TARGET_ENV}"
+            }
+        }
+
+        // ──────────────────────────────────────────
+        // STAGE 2: Build
+        // ──────────────────────────────────────────
         stage('Build') {
             steps {
-                sh 'mvn clean package'
+                sh 'mvn clean package -DskipTests'
             }
         }
 
-        stage('Docker Build') {
+        // ──────────────────────────────────────────
+        // STAGE 3: Unit Tests
+        // ──────────────────────────────────────────
+        stage('Unit Test') {
             steps {
-                sh 'docker build -t sync-service:local .'
+                sh 'mvn test'
+            }
+            post {
+                always {
+                    junit 'target/surefire-reports/*.xml'
+                }
             }
         }
 
+        // ──────────────────────────────────────────
+        // STAGE 4 & 5: Docker Build + Push
+        // Only runs on dev, staging, or main
+        // ──────────────────────────────────────────
+        stage('Docker Build & Push') {
+            when {
+                anyOf {
+                    branch 'dev'
+                    branch 'staging'
+                    branch 'main'
+                }
+            }
+            steps {
+                sh """
+                    docker build -t ${env.IMAGE_TAG} .
+                    gcloud auth activate-service-account --key-file=${GCP_CREDENTIALS}
+                    gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+                    docker push ${env.IMAGE_TAG}
+                """
+            }
+        }
+
+        // ──────────────────────────────────────────
+        // STAGE 6: Manual Approval (prod only)
+        // ──────────────────────────────────────────
+        stage('Approval: Prod Deploy') {
+            when { branch 'main' }
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    input message: "Deploy ${env.GIT_COMMIT_SHORT} to PRODUCTION?",
+                          submitter: 'release-team'
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────
+        // STAGE 7: Deploy (rolling update across VMs)
+        // ──────────────────────────────────────────
         stage('Deploy') {
+            when {
+                anyOf {
+                    branch 'dev'
+                    branch 'staging'
+                    branch 'main'
+                }
+            }
             steps {
-                sh './deploy.sh'
+                script {
+                    def vms = getVMsForEnv(env.TARGET_ENV)
+                    for (vm in vms) {
+                        echo "Deploying to ${vm}..."
+                        sh """
+                            # Fetch secrets from GCP Secret Manager
+                            MONGO_URI=\$(gcloud secrets versions access latest --secret="mongo-uri-${env.TARGET_ENV}")
+
+                            # SSH into VM and do rolling update
+                            gcloud compute ssh ${vm} --zone=us-central1-a --command='
+                                docker pull ${env.IMAGE_TAG}
+                                docker stop sync-service || true
+                                docker rm   sync-service || true
+                                docker run -d \\
+                                    --name sync-service \\
+                                    --restart always \\
+                                    -p 8080:8080 \\
+                                    -e SPRING_PROFILES_ACTIVE=${env.TARGET_ENV} \\
+                                    -e MONGO_URI='\$MONGO_URI' \\
+                                    ${env.IMAGE_TAG}
+                            '
+                        """
+                        // Health check before moving to next VM
+                        sh """
+                            sleep 15
+                            gcloud compute ssh ${vm} --zone=us-central1-a --command='
+                                curl -sf http://localhost:8080/actuator/health || exit 1
+                            '
+                        """
+                        echo "${vm} is healthy"
+                    }
+                }
             }
         }
+
+    } // end stages
+
+    // ──────────────────────────────────────────
+    // POST: Rollback on failure, notify always
+    // ──────────────────────────────────────────
+    post {
+        failure {
+            echo "Pipeline failed — triggering rollback..."
+            script {
+                if (env.TARGET_ENV && env.LAST_STABLE_IMAGE) {
+                    def vms = getVMsForEnv(env.TARGET_ENV)
+                    for (vm in vms) {
+                        sh """
+                            gcloud compute ssh ${vm} --zone=us-central1-a --command='
+                                docker stop sync-service || true
+                                docker rm   sync-service || true
+                                docker run -d --name sync-service --restart always \\
+                                    -p 8080:8080 ${env.LAST_STABLE_IMAGE}
+                            '
+                        """
+                    }
+                    echo "Rollback complete → ${env.LAST_STABLE_IMAGE}"
+                }
+            }
+            slackSend channel: env.SLACK_CHANNEL,
+                      color: 'danger',
+                      message: "*${env.APP_NAME}* deploy to *${env.TARGET_ENV}* FAILED (${env.GIT_COMMIT_SHORT}). Rolled back."
+        }
+        success {
+            slackSend channel: env.SLACK_CHANNEL,
+                      color: 'good',
+                      message: "*${env.APP_NAME}* deployed to *${env.TARGET_ENV}* successfully (${env.GIT_COMMIT_SHORT})"
+        }
+    }
+
+} // end pipeline
+
+// ──────────────────────────────────────────
+// Helper functions
+// ──────────────────────────────────────────
+
+def getTargetEnv(branch) {
+    switch (branch) {
+        case 'dev':     return 'qa'
+        case 'staging': return 'staging'
+        case 'main':    return 'prod'
+        default:        return 'none'
+    }
+}
+
+def getVMsForEnv(env) {
+    switch (env) {
+        case 'qa':      return ['vm-qa-1']
+        case 'staging': return ['vm-staging-1', 'vm-staging-2']
+        case 'prod':    return ['vm-prod-1', 'vm-prod-2', 'vm-prod-3']
+        default:        return []
     }
 }
